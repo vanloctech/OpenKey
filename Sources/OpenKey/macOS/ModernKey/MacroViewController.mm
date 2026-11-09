@@ -16,6 +16,8 @@
 
 @end
 
+extern "C" void ApplyLiquidGlassStyle(NSView* root);
+
 @implementation MacroViewController{
     vector<vector<Uint32>> keys;
     vector<string> macroText;
@@ -24,6 +26,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ApplyLiquidGlassStyle(self.view);
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
     

@@ -13,10 +13,13 @@
 
 @end
 
+extern void ApplyLiquidGlassStyle(NSView* root);
+
 @implementation AboutViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ApplyLiquidGlassStyle(self.view);
     // Do view setup here.
     
     self.VersionInfo.stringValue = [NSString stringWithFormat:@"Phiên bản %@ (build %@) - Ngày cập nhật %@",
