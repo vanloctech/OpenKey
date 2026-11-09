@@ -34,6 +34,12 @@ static CFRunLoopSourceRef runLoopSource;
     return _isInited;
 }
 
++(void)reEnableEventTapIfNeeded {
+    if (_isInited && eventTap && !CGEventTapIsEnabled(eventTap)) {
+        CGEventTapEnable(eventTap, true);
+    }
+}
+
 +(BOOL)initEventTap {
     if (_isInited)
         return true;

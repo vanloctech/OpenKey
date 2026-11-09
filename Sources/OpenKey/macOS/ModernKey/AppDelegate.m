@@ -11,6 +11,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ServiceManagement/ServiceManagement.h>
 #include <libproc.h>
+#import <IOKit/IOKitLib.h>
 #include <sys/proc_info.h>
 #import "AppDelegate.h"
 #import "ViewController.h"
@@ -89,12 +90,18 @@ extern bool convertToolDontAlertWhenCompleted;
     NSMenuItem* mnuVietnameseLocaleCP1258;
     
     NSMenuItem* mnuQuickConvert;
+    
+    NSMenuItem* mnuSecureInputWarning;
+    NSTimer* secureInputTimer;
+    pid_t lastSecureInputPID;
+    NSString* inputSourceBeforeFallback; //input source to restore when Secure Input is released
+    NSString* fallbackInputSourceID;     //Apple Vietnamese input source we switched to
 }
 
 -(void)askPermission {
     NSAlert *alert = [[NSAlert alloc] init];
     [alert setMessageText: [NSString stringWithFormat:@"OpenKey cần bạn cấp quyền để có thể hoạt động!"]];
-    [alert setInformativeText:@"Vui lòng chạy lại ứng dụng sau khi cấp quyền."];
+    [alert setInformativeText:@"Bật OpenKey trong Cài đặt hệ thống → Quyền riêng tư & Bảo mật → Trợ năng. Nếu OpenKey đã có trong danh sách mà vẫn không chạy, hãy xoá mục đó (nút \"−\") rồi thêm lại. OpenKey sẽ tự hoạt động ngay khi được cấp quyền."];
 
     [alert addButtonWithTitle:@"Không"];
     [alert addButtonWithTitle:@"Cấp quyền"];
@@ -104,11 +111,21 @@ extern bool convertToolDontAlertWhenCompleted;
 
     NSModalResponse res = [alert runModal];
 
-    if (res == 1001) {
-        MJAccessibilityOpenPanel();
+    if (res != NSAlertSecondButtonReturn) {
+        [NSApp terminate:0];
+        return;
     }
-
-    [NSApp terminate:0];
+    
+    MJAccessibilityOpenPanel();
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
+    
+    //keep running and wait until the permission is granted, then start normally
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        if (MJAccessibilityIsEnabled()) {
+            [timer invalidate];
+            [self startOpenKey];
+        }
+    }];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
@@ -151,6 +168,10 @@ extern bool convertToolDontAlertWhenCompleted;
         return;
     }
     
+    [self startOpenKey];
+}
+
+-(void)startOpenKey {
     vShowIconOnDock = (int)[[NSUserDefaults standardUserDefaults] integerForKey:@"vShowIconOnDock"];
     if (vShowIconOnDock)
         [NSApp setActivationPolicy: NSApplicationActivationPolicyRegular];
@@ -159,6 +180,7 @@ extern bool convertToolDontAlertWhenCompleted;
         NSBeep();
 
     [self createStatusBarMenu];
+    [self startSecureInputWatcher];
     
     //init
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -206,6 +228,10 @@ extern bool convertToolDontAlertWhenCompleted;
     
     theMenu = [[NSMenu alloc] initWithTitle:@""];
     [theMenu setAutoenablesItems:NO];
+    
+    mnuSecureInputWarning = [theMenu addItemWithTitle:@"" action:nil keyEquivalent:@""];
+    mnuSecureInputWarning.enabled = NO;
+    mnuSecureInputWarning.hidden = YES;
     
     menuInputMethod = [theMenu addItemWithTitle:@"Bật Tiếng Việt"
                                                      action:@selector(onInputMethodSelected)
@@ -531,6 +557,175 @@ extern bool convertToolDontAlertWhenCompleted;
 -(void)onSwitchLanguage {
     [self onInputMethodSelected];
     [viewController fillData];
+}
+
+#pragma mark Secure Input watcher
+//When any app enables Secure Event Input (password fields, Terminal "Secure Keyboard Entry",
+//or an app that forgets to turn it off), macOS stops delivering key events to OpenKey.
+//It cannot be bypassed, but we can tell the user which app is holding it.
+-(pid_t)currentSecureInputPID {
+    if (!IsSecureEventInputEnabled())
+        return 0;
+    //Note: CGSessionCopyCurrentDictionary() reports the frontmost app's PID here, not the owner.
+    //The real owner is published by WindowServer in IORegistry (IOConsoleUsers).
+    pid_t result = -1;
+    io_registry_entry_t root = IORegistryGetRootEntry(kIOMainPortDefault);
+    if (root == MACH_PORT_NULL)
+        return result;
+    NSArray* users = (__bridge_transfer NSArray*)IORegistryEntryCreateCFProperty(root, CFSTR("IOConsoleUsers"), kCFAllocatorDefault, 0);
+    IOObjectRelease(root);
+    uid_t uid = getuid();
+    for (NSDictionary* user in users) {
+        if (![user isKindOfClass:[NSDictionary class]])
+            continue;
+        NSNumber* userID = user[@"kCGSSessionUserIDKey"];
+        NSNumber* pid = user[@"kCGSSessionSecureInputPID"];
+        if (pid && (!userID || userID.unsignedIntValue == uid)) {
+            result = (pid_t)pid.intValue;
+            break;
+        }
+    }
+    return result;
+}
+
+-(NSString*)appNameForPID:(pid_t)pid {
+    if (pid <= 0)
+        return @"không xác định";
+    NSRunningApplication* app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (app.localizedName)
+        return [NSString stringWithFormat:@"%@ (PID %d)", app.localizedName, pid];
+    char name[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_name(pid, name, sizeof(name)) > 0)
+        return [NSString stringWithFormat:@"%s (PID %d)", name, pid];
+    return [NSString stringWithFormat:@"PID %d", pid];
+}
+
+#pragma mark Fallback to Apple's Vietnamese input source
+//While Secure Input is on, macOS blocks every third-party input method (event taps and InputMethodKit
+//alike) but still runs Apple's own Vietnamese input sources. Switch to one of them so the user can keep
+//typing Vietnamese, and switch back when Secure Input is released.
+
+static NSString* InputSourceID(TISInputSourceRef source) {
+    return source ? (__bridge NSString*)TISGetInputSourceProperty(source, kTISPropertyInputSourceID) : nil;
+}
+
+static TISInputSourceRef CopyInputSourceWithID(NSString* sourceID) {
+    if (sourceID == nil)
+        return NULL;
+    NSArray* list = (__bridge_transfer NSArray*)TISCreateInputSourceList((__bridge CFDictionaryRef)@{(__bridge id)kTISPropertyInputSourceID: sourceID}, false);
+    if (list.count == 0)
+        return NULL;
+    return (TISInputSourceRef)CFRetain((__bridge CFTypeRef)list.firstObject);
+}
+
+//enabled Apple Vietnamese input mode that best matches the OpenKey input type
+-(TISInputSourceRef)copyAppleVietnameseInputSource {
+    NSArray* preferred = vInputType == 1
+        ? @[@"com.apple.inputmethod.VietnameseIM.VietnameseVNI"]
+        : @[@"com.apple.inputmethod.VietnameseIM.VietnameseSimpleTelex", @"com.apple.inputmethod.VietnameseIM.VietnameseTelex"];
+    for (NSString* sourceID in preferred) {
+        TISInputSourceRef source = CopyInputSourceWithID(sourceID);
+        if (source)
+            return source;
+    }
+    NSArray* list = (__bridge_transfer NSArray*)TISCreateInputSourceList((__bridge CFDictionaryRef)@{
+        (__bridge id)kTISPropertyBundleID: @"com.apple.inputmethod.VietnameseIM",
+        (__bridge id)kTISPropertyInputSourceIsSelectCapable: @YES}, false);
+    return list.count ? (TISInputSourceRef)CFRetain((__bridge CFTypeRef)list.firstObject) : NULL;
+}
+
+//returns the localized name of the input source we switched to, nil if none is available
+-(NSString*)switchToAppleVietnamese {
+    if (fallbackInputSourceID)
+        return nil;
+    TISInputSourceRef target = [self copyAppleVietnameseInputSource];
+    if (target == NULL)
+        return nil;
+    TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
+    NSString* currentID = InputSourceID(current);
+    NSString* name = (__bridge NSString*)TISGetInputSourceProperty(target, kTISPropertyLocalizedName);
+    BOOL switched = NO;
+    if (![currentID isEqualToString:InputSourceID(target)] && TISSelectInputSource(target) == noErr) {
+        inputSourceBeforeFallback = [currentID copy];
+        fallbackInputSourceID = [InputSourceID(target) copy];
+        switched = YES;
+    }
+    name = [name copy];
+    if (current) CFRelease(current);
+    CFRelease(target);
+    return switched ? name : nil;
+}
+
+-(void)restoreInputSourceAfterFallback {
+    if (fallbackInputSourceID == nil)
+        return;
+    TISInputSourceRef current = TISCopyCurrentKeyboardInputSource();
+    //only switch back if the user did not pick another input source meanwhile
+    if ([InputSourceID(current) isEqualToString:fallbackInputSourceID]) {
+        TISInputSourceRef previous = CopyInputSourceWithID(inputSourceBeforeFallback);
+        if (previous) {
+            TISSelectInputSource(previous);
+            CFRelease(previous);
+        }
+    }
+    if (current) CFRelease(current);
+    inputSourceBeforeFallback = nil;
+    fallbackInputSourceID = nil;
+}
+
+-(void)checkSecureInput {
+    //also recover the tap if macOS disabled it without notifying us
+    [OpenKeyManager reEnableEventTapIfNeeded];
+    
+    pid_t pid = [self currentSecureInputPID];
+    if (pid == lastSecureInputPID)
+        return;
+    BOOL justEnabled = (lastSecureInputPID == 0);
+    lastSecureInputPID = pid;
+    
+    if (pid == 0) {
+        [self restoreInputSourceAfterFallback];
+        statusItem.button.title = @"";
+        statusItem.button.toolTip = nil;
+        mnuSecureInputWarning.hidden = YES;
+        return;
+    }
+    
+    NSString* fallbackName = nil;
+    if (justEnabled && vLanguage == 1) {
+        fallbackName = [self switchToAppleVietnamese];
+    }
+    
+    NSString* holder = [self appNameForPID:pid];
+    NSString* msg;
+    NSString* hint;
+    if (fallbackInputSourceID) {
+        msg = [NSString stringWithFormat:@"⚠️ Secure Input bật bởi %@ — đã tạm chuyển sang bộ gõ %@ của Apple", holder,
+               fallbackName ?: @"tiếng Việt"];
+        hint = @"OpenKey sẽ tự chuyển lại khi Secure Input tắt.";
+    } else {
+        msg = [NSString stringWithFormat:@"⚠️ Secure Input bật bởi %@ — không thể gõ tiếng Việt", holder];
+        hint = @"Thêm bộ gõ \"Vietnamese – Simple Telex\" trong Cài đặt → Bàn phím → Nguồn đầu vào để OpenKey tự chuyển sang khi bị chặn. Hoặc thoát app đó / đăng xuất.";
+    }
+    statusItem.button.title = @"⚠";
+    statusItem.button.imagePosition = NSImageLeft;
+    statusItem.button.toolTip = [NSString stringWithFormat:@"%@.\n%@", msg, hint];
+    mnuSecureInputWarning.title = msg;
+    mnuSecureInputWarning.toolTip = hint;
+    mnuSecureInputWarning.hidden = NO;
+}
+
+-(void)startSecureInputWatcher {
+    if (secureInputTimer)
+        return;
+    lastSecureInputPID = 0;
+    secureInputTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                        target:self
+                                                      selector:@selector(checkSecureInput)
+                                                      userInfo:nil
+                                                       repeats:YES];
+    secureInputTimer.tolerance = 0.5;
+    [self checkSecureInput];
 }
 
 #pragma mark Reset OpenKey after mac computer awake

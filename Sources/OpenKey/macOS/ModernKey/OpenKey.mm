@@ -11,6 +11,7 @@
 #import "Engine.h"
 #import "AppDelegate.h"
 #import "ViewController.h"
+#import "OpenKeyManager.h"
 
 #define FRONT_APP [[NSWorkspace sharedWorkspace] frontmostApplication].bundleIdentifier
 #define OTHER_CONTROL_KEY (_flag & kCGEventFlagMaskCommand) || (_flag & kCGEventFlagMaskControl) || \
@@ -86,6 +87,25 @@ extern "C" {
     
     NSString* _frontMostApp = @"UnknownApp";
     
+    //true while one of Apple's Vietnamese input sources is selected (e.g. OpenKey switched to
+    //Simple Telex because Secure Input blocks the event tap): that input source does the typing
+    static volatile bool _appleVietnameseActive = false;
+    
+    static void UpdateAppleVietnameseActive() {
+        TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+        if (source == NULL) {
+            _appleVietnameseActive = false;
+            return;
+        }
+        CFStringRef bundleId = (CFStringRef)TISGetInputSourceProperty(source, kTISPropertyBundleID);
+        _appleVietnameseActive = bundleId != NULL && CFStringCompare(bundleId, CFSTR("com.apple.inputmethod.VietnameseIM"), 0) == kCFCompareEqualTo;
+        CFRelease(source);
+    }
+    
+    static void OnInputSourceChanged(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+        UpdateAppleVietnameseActive();
+    }
+    
     void OpenKeyInit() {
         //load saved data
         vFreeMark = 0;//(int)[[NSUserDefaults standardUserDefaults] integerForKey:@"FreeMark"];
@@ -116,6 +136,11 @@ extern "C" {
         
         myEventSource = CGEventSourceCreate(kCGEventSourceStatePrivate);
         pData = (vKeyHookState*)vKeyInit();
+        
+        UpdateAppleVietnameseActive();
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(), NULL, OnInputSourceChanged,
+                                        kTISNotifySelectedKeyboardInputSourceChanged, NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
 
         eventBackSpaceDown = CGEventCreateKeyboardEvent (myEventSource, 51, true);
         eventBackSpaceUp = CGEventCreateKeyboardEvent (myEventSource, 51, false);
@@ -599,8 +624,21 @@ extern "C" {
      * MAIN Callback.
      */
     CGEventRef OpenKeyCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+        //macOS disables the tap if the callback is too slow or on some user input;
+        //re-enable it, otherwise Vietnamese typing stops silently
+        if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [OpenKeyManager reEnableEventTapIfNeeded];
+            });
+            return event;
+        }
         //dont handle my event
         if (CGEventGetIntegerValueField(event, kCGEventSourceStateID) == CGEventSourceGetSourceStateID(myEventSource)) {
+            return event;
+        }
+        
+        //Apple's Vietnamese input source is handling typing; don't add marks twice
+        if (_appleVietnameseActive) {
             return event;
         }
         
@@ -696,15 +734,16 @@ extern "C" {
             if ( isource != NULL )
             {
                 CFArrayRef languages = (CFArrayRef) TISGetInputSourceProperty(isource, kTISPropertyInputSourceLanguages);
-                
-                if (CFArrayGetCount(languages) > 0) {
+                BOOL isOtherLanguage = NO;
+                if (languages != NULL && CFArrayGetCount(languages) > 0) {
+                    //Get-rule objects: owned by isource, must not be released here
                     CFStringRef langRef = (CFStringRef)CFArrayGetValueAtIndex(languages, 0);
                     NSString *currentLanguage = (__bridge NSString *)langRef;
-                    if(![currentLanguage isLike:@"en"]){
-                        return event;
-                    }
-                    CFRelease(langRef);
-                    CFRelease(isource);
+                    isOtherLanguage = ![currentLanguage isLike:@"en"];
+                }
+                CFRelease(isource);
+                if (isOtherLanguage) {
+                    return event;
                 }
             }
         }
