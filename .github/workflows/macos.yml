@@ -1,0 +1,76 @@
+name: macOS
+
+on:
+  push:
+    branches: [ "master", "fix/**" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Liquid Glass UI needs the macOS 26 SDK
+    runs-on: macos-26
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Select latest Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Build (ad-hoc signed)
+      working-directory: Sources/OpenKey/macOS
+      run: |
+        xcodebuild -project OpenKey.xcodeproj -scheme OpenKey -configuration Release \
+          -derivedDataPath "$RUNNER_TEMP/dd" \
+          CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
+          MACOSX_DEPLOYMENT_TARGET=12.0 ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+          build
+
+    - name: Package
+      run: |
+        APP="$RUNNER_TEMP/dd/Build/Products/Release/OpenKey.app"
+        VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist")
+        echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+        mkdir -p dist
+        ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/OpenKey-macOS-$VERSION-${GITHUB_SHA::7}.zip"
+        ls -la dist
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: OpenKey-macOS
+        path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: OpenKey-macOS
+        path: dist
+
+    - name: Create GitHub release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" dist/*.zip -R "$GITHUB_REPOSITORY" --title "OpenKey $GITHUB_REF_NAME" --notes "$(cat <<'EOF'
+        Bản build macOS chưa được Apple notarize (ký ad-hoc).
+
+        Cài đặt:
+        1. Giải nén, kéo OpenKey.app vào thư mục Applications.
+        2. Mở Terminal và chạy: xattr -cr /Applications/OpenKey.app
+        3. Mở OpenKey, cấp quyền tại Cài đặt → Quyền riêng tư & Bảo mật → Trợ năng.
+           Nếu cập nhật từ bản cũ: xoá OpenKey khỏi danh sách Trợ năng (nút −) rồi thêm lại.
+        EOF
+        )"
