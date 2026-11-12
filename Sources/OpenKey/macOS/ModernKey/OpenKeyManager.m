@@ -25,6 +25,7 @@ extern NSString* ConvertUtil(NSString* str);
 
 }
 static BOOL _isInited = NO;
+static BOOL _engineInited = NO; //engine/observers must be initialized only once, the tap can be recreated
 
 static CFMachPortRef      eventTap;
 static CGEventMask        eventMask;
@@ -34,12 +35,31 @@ static CFRunLoopSourceRef runLoopSource;
     return _isInited;
 }
 
++(void)reEnableEventTapIfNeeded {
+    if (_isInited && eventTap && CFMachPortIsValid(eventTap) && !CGEventTapIsEnabled(eventTap)) {
+        CGEventTapEnable(eventTap, true);
+    }
+}
+
++(BOOL)isEventTapHealthy {
+    return _isInited && eventTap && CFMachPortIsValid(eventTap) && CGEventTapIsEnabled(eventTap);
+}
+
+//throw away the current tap (it may be dead after sleep, screen lock or a permission change) and create a new one
++(BOOL)recreateEventTap {
+    [self stopEventTap];
+    return [self initEventTap];
+}
+
 +(BOOL)initEventTap {
     if (_isInited)
         return true;
     
     //init modernKey
-    OpenKeyInit();
+    if (!_engineInited) {
+        OpenKeyInit();
+        _engineInited = YES;
+    }
     
     // Create an event tap. We are interested in key presses.
     eventMask = ((1 << kCGEventKeyDown) |
@@ -63,13 +83,18 @@ static CFRunLoopSourceRef runLoopSource;
         return NO;
     }
     
-    _isInited = YES;
-    
     // Create a run loop source.
     runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
+    if (!runLoopSource) {
+        CFMachPortInvalidate(eventTap);
+        CFRelease(eventTap);
+        eventTap = nil;
+        return NO;
+    }
+    _isInited = YES;
     
-    // Add to the current run loop.
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+    // Add to the main run loop.
+    CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
     
     // Enable the event tap.
     CGEventTapEnable(eventTap, true);
@@ -79,13 +104,16 @@ static CFRunLoopSourceRef runLoopSource;
 
 +(BOOL)stopEventTap {
     if (_isInited) { //release all object
-        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
-        CFRelease(runLoopSource);
-        runLoopSource = nil;
-        
-        CFMachPortInvalidate(eventTap);
-        CFRelease(eventTap);
-        eventTap = nil;
+        if (runLoopSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+            CFRelease(runLoopSource);
+            runLoopSource = nil;
+        }
+        if (eventTap) {
+            CFMachPortInvalidate(eventTap);
+            CFRelease(eventTap);
+            eventTap = nil;
+        }
         
         _isInited = false;
     }

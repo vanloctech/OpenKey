@@ -17,10 +17,13 @@ extern AppDelegate* appDelegate;
 
 @end
 
+extern "C" void ApplyLiquidGlassStyle(NSView* root);
+
 @implementation ConvertToolViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ApplyLiquidGlassStyle(self.view);
 
     self.SHotKey.Parent = self;
     [self fillData];

@@ -15,6 +15,31 @@ extern AppDelegate* appDelegate;
 extern void OnSpellCheckingChanged(void);
 
 ViewController* viewController;
+
+#pragma mark Liquid Glass (macOS 26+)
+//Restyle the storyboard controls to the native macOS 26 look. Older systems keep the classic style.
+void ApplyLiquidGlassStyle(NSView* root) {
+    if (@available(macOS 26.0, *)) {
+        for (NSView* v in root.subviews) {
+            if ([v isKindOfClass:[NSBox class]]) {
+                NSBox* box = (NSBox*)v;
+                //grouped section like System Settings: rounded, borderless, subtle fill
+                if (box.boxType == NSBoxCustom && box.borderWidth > 0) {
+                    box.borderWidth = 0;
+                    box.cornerRadius = 14;
+                    box.fillColor = [NSColor quaternarySystemFillColor];
+                }
+            } else if ([v isKindOfClass:[NSButton class]]) {
+                NSButton* button = (NSButton*)v;
+                if (button.bezelStyle == NSBezelStyleSmallSquare && button.bordered) {
+                    button.bezelStyle = NSBezelStyleGlass;
+                    button.controlSize = NSControlSizeLarge;
+                }
+            }
+            ApplyLiquidGlassStyle(v);
+        }
+    }
+}
 extern int vFreeMark;
 extern int vCheckSpelling;
 extern int vUseModernOrthography;
@@ -49,6 +74,8 @@ extern int vPerformLayoutCompat;
     NSArray* tabviews, *tabbuttons;
     NSRect tabViewRect;
     NSView* tabButtonBackground;
+    NSSegmentedControl* tabSegment; //macOS 26+: native tab switcher replacing the tab buttons
+    NSMutableArray* switchPairs;    //macOS 26+: [checkbox, NSSwitch, label] rows mirroring the storyboard checkboxes
 }
 
 - (void)viewDidLoad {
@@ -82,6 +109,7 @@ extern int vPerformLayoutCompat;
         b.frame = tabViewRect;
     }
     
+    [self setupLiquidGlass];
     [self showTab:0];
     
     NSArray* inputTypeData = [[NSArray alloc] initWithObjects:@"Telex", @"VNI", @"Simple Telex 1", @"Simple Telex 2", nil];
@@ -132,6 +160,235 @@ extern int vPerformLayoutCompat;
     // Update the view, if already loaded.
 }
 
+#define SETTINGS_ROW_HEIGHT 36.0
+#define SETTINGS_ROW_INSET 14.0
+
+//storyboard push button (as opposed to a checkbox)
+static BOOL IsPushButton(NSButton* button) {
+    return button.bezelStyle == NSBezelStylePush;
+}
+
+//Turn the checkboxes of a tab into System Settings style rows: title on the left, NSSwitch on the right,
+//separators in between. The original checkboxes stay (hidden) as the model, so all existing actions keep working.
+-(NSView*)buildSettingsRowsInBox:(NSBox*)box API_AVAILABLE(macos(26.0)) {
+    NSMutableArray<NSButton*>* sources = [NSMutableArray array];
+    for (NSView* v in box.contentView.subviews) {
+        if ([v isKindOfClass:[NSButton class]] && !v.hidden)
+            [sources addObject:(NSButton*)v];
+    }
+    if (sources.count == 0)
+        return nil;
+    //reading order: left column then right column, top to bottom; buttons last
+    [sources sortUsingComparator:^NSComparisonResult(NSButton* a, NSButton* b) {
+        int ka = IsPushButton(a), kb = IsPushButton(b);
+        if (ka != kb) return ka < kb ? NSOrderedAscending : NSOrderedDescending;
+        int ca = NSMinX(a.frame) > 200, cb = NSMinX(b.frame) > 200;
+        if (ca != cb) return ca < cb ? NSOrderedAscending : NSOrderedDescending;
+        return NSMinY(a.frame) > NSMinY(b.frame) ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    
+    CGFloat width = NSWidth(box.frame);
+    CGFloat height = sources.count * SETTINGS_ROW_HEIGHT;
+    NSView* list = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
+    NSInteger index = 0;
+    for (NSButton* src in sources) {
+        NSView* row = [[NSView alloc] initWithFrame:NSMakeRect(0, height - (index + 1) * SETTINGS_ROW_HEIGHT, width, SETTINGS_ROW_HEIGHT)];
+        BOOL isPush = IsPushButton(src);
+        NSString* text = isPush ? [src.title stringByReplacingOccurrencesOfString:@"..." withString:@""] : src.title;
+        NSTextField* label = [NSTextField labelWithString:text];
+        label.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+        label.lineBreakMode = NSLineBreakByTruncatingTail;
+        label.toolTip = src.toolTip ?: text;
+        
+        NSControl* control;
+        if (isPush) {
+            NSButton* button = [NSButton buttonWithTitle:([src.title containsString:@"Kiểm tra"] ? @"Kiểm tra" : @"Mở…")
+                                                  target:src.target action:src.action];
+            [button sizeToFit];
+            control = button;
+        } else {
+            NSSwitch* sw = [[NSSwitch alloc] init];
+            sw.controlSize = NSControlSizeSmall;
+            sw.target = self;
+            sw.action = @selector(onSettingsSwitch:);
+            sw.tag = switchPairs.count;
+            sw.toolTip = label.toolTip;
+            [sw sizeToFit];
+            [switchPairs addObject:@[src, sw, label]];
+            control = sw;
+        }
+        src.hidden = YES;
+        
+        NSRect cf = control.frame;
+        cf.origin.x = width - SETTINGS_ROW_INSET - NSWidth(cf);
+        cf.origin.y = round((SETTINGS_ROW_HEIGHT - NSHeight(cf)) / 2);
+        control.frame = cf;
+        [label sizeToFit];
+        NSRect lf = label.frame;
+        lf.origin.x = SETTINGS_ROW_INSET;
+        lf.size.width = NSMinX(cf) - 12 - SETTINGS_ROW_INSET;
+        lf.origin.y = round((SETTINGS_ROW_HEIGHT - NSHeight(lf)) / 2);
+        label.frame = lf;
+        [row addSubview:label];
+        [row addSubview:control];
+        if (index > 0) {
+            NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(SETTINGS_ROW_INSET, SETTINGS_ROW_HEIGHT - 1, width - 2 * SETTINGS_ROW_INSET, 1)];
+            separator.boxType = NSBoxSeparator;
+            [row addSubview:separator];
+        }
+        [list addSubview:row];
+        index++;
+    }
+    [box.contentView addSubview:list];
+    return list;
+}
+
+-(void)onSettingsSwitch:(NSSwitch*)sender {
+    NSButton* checkbox = switchPairs[sender.tag][0];
+    checkbox.state = sender.state;
+    [NSApp sendAction:checkbox.action to:checkbox.target from:checkbox];
+    [self syncSettingsSwitches]; //actions may enable/disable dependent options
+}
+
+-(void)syncSettingsSwitches {
+    for (NSArray* pair in switchPairs) {
+        NSButton* checkbox = pair[0];
+        NSSwitch* sw = pair[1];
+        NSTextField* label = pair[2];
+        sw.state = checkbox.state;
+        sw.enabled = checkbox.enabled;
+        label.textColor = checkbox.enabled ? [NSColor labelColor] : [NSColor tertiaryLabelColor];
+    }
+}
+
+-(void)setupLiquidGlass {
+    if (@available(macOS 26.0, *)) {
+        ApplyLiquidGlassStyle(self.view);
+        switchPairs = [NSMutableArray array];
+        
+        //1. settings rows in each tab
+        NSMutableArray* lists = [NSMutableArray array];
+        CGFloat groupHeight = 0;
+        for (NSBox* box in tabviews) {
+            box.contentViewMargins = NSZeroSize;
+            box.contentView.autoresizesSubviews = NO; //we position the content ourselves
+            NSView* list = [self buildSettingsRowsInBox:box];
+            [lists addObject:list ?: [NSNull null]];
+            groupHeight = MAX(groupHeight, list ? NSHeight(list.frame) : NSHeight(box.frame));
+        }
+        
+        //2. native tab switcher replacing the 4 push buttons
+        NSMutableArray* labels = [NSMutableArray array];
+        for (NSButton* button in tabbuttons) {
+            [labels addObject:button.title];
+            button.hidden = YES;
+        }
+        tabButtonBackground.hidden = YES;
+        tabSegment = [NSSegmentedControl segmentedControlWithLabels:labels
+                                                       trackingMode:NSSegmentSwitchTrackingSelectOne
+                                                             target:self
+                                                             action:@selector(onTabSegment:)];
+        tabSegment.controlSize = NSControlSizeLarge;
+        tabSegment.segmentDistribution = NSSegmentDistributionFillEqually;
+        [tabSegment sizeToFit];
+        tabSegment.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+        [self.view addSubview:tabSegment];
+        
+        //3. relayout top to bottom: control group, tabs, tab content, buttons
+        NSBox* controlBox = nil;
+        NSButton *quitButton = nil, *defaultButton = nil, *okButton = nil;
+        for (NSView* v in self.view.subviews) {
+            if ([v isKindOfClass:[NSBox class]] && [((NSBox*)v).title isEqualToString:@"Điều khiển"])
+                controlBox = (NSBox*)v;
+            if (![v isKindOfClass:[NSButton class]])
+                continue;
+            SEL action = ((NSButton*)v).action;
+            if (action == @selector(onTerminateApp:)) quitButton = (NSButton*)v;
+            else if (action == @selector(onDefaultConfig:)) defaultButton = (NSButton*)v;
+            else if (action == @selector(onOK:)) okButton = (NSButton*)v;
+        }
+        if (controlBox == nil)
+            return;
+        
+        const CGFloat margin = 20, gap = 14, buttonArea = 72;
+        CGFloat segmentHeight = NSHeight(tabSegment.frame);
+        CGFloat oldHeight = NSHeight(self.view.frame);
+        CGFloat topToControlBottom = oldHeight - NSMinY(controlBox.frame);
+        CGFloat newHeight = topToControlBottom + gap + segmentHeight + gap + groupHeight + buttonArea;
+        NSRect viewFrame = self.view.frame;
+        viewFrame.size.height = newHeight;
+        self.view.frame = viewFrame; //top-anchored views follow via autoresizing
+        
+        CGFloat width = NSWidth(self.view.bounds);
+        NSRect segmentFrame = tabSegment.frame;
+        segmentFrame.size.width = MIN(MAX(NSWidth(segmentFrame), 360), width - 2 * margin);
+        segmentFrame.origin.x = round((width - NSWidth(segmentFrame)) / 2);
+        segmentFrame.origin.y = NSMinY(controlBox.frame) - gap - segmentHeight;
+        tabSegment.frame = segmentFrame;
+        
+        CGFloat groupTop = NSMinY(segmentFrame) - gap;
+        tabViewRect = NSMakeRect(NSMinX(controlBox.frame), groupTop - groupHeight, NSWidth(controlBox.frame), groupHeight);
+        for (NSUInteger i = 0; i < tabviews.count; i++) {
+            NSBox* box = tabviews[i];
+            CGFloat oldContentHeight = NSHeight(box.contentView.frame);
+            box.frame = tabViewRect;
+            CGFloat contentHeight = NSHeight(box.contentView.frame);
+            id list = lists[i];
+            if (list != [NSNull null]) {
+                NSRect lf = ((NSView*)list).frame;
+                lf.origin.y = contentHeight - NSHeight(lf);
+                ((NSView*)list).frame = lf;
+            } else {
+                //info tab: keep its content pinned to the top
+                for (NSView* v in box.contentView.subviews) {
+                    NSRect f = v.frame;
+                    f.origin.y += contentHeight - oldContentHeight;
+                    v.frame = f;
+                }
+            }
+        }
+        
+        //4. dialog buttons: plain native buttons, default action on the right
+        NSArray* buttons = @[quitButton ?: [NSNull null], defaultButton ?: [NSNull null], okButton ?: [NSNull null]];
+        for (id b in buttons) {
+            if (b == [NSNull null]) continue;
+            NSButton* button = b;
+            button.image = nil;
+            button.imagePosition = NSNoImage;
+            button.bezelStyle = NSBezelStyleGlass;
+            button.controlSize = NSControlSizeLarge;
+            button.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+            [button sizeToFit];
+            NSRect f = button.frame;
+            f.size.width = MAX(NSWidth(f), 110);
+            f.origin.y = round((buttonArea - NSHeight(f)) / 2);
+            button.frame = f;
+        }
+        if (okButton) {
+            okButton.bezelColor = [NSColor controlAccentColor];
+            okButton.keyEquivalent = @"\r";
+            NSRect f = okButton.frame;
+            f.origin.x = width - margin - NSWidth(f);
+            okButton.frame = f;
+            if (defaultButton) {
+                NSRect d = defaultButton.frame;
+                d.origin.x = NSMinX(f) - 12 - NSWidth(d);
+                defaultButton.frame = d;
+            }
+        }
+        if (quitButton) {
+            NSRect f = quitButton.frame;
+            f.origin.x = margin;
+            quitButton.frame = f;
+        }
+        [self syncSettingsSwitches];
+    }
+}
+
+-(void)onTabSegment:(NSSegmentedControl*)sender {
+    [self showTab:sender.selectedSegment];
+}
+
 -(void)showTab:(NSInteger)index {
     NSRect tempRect = tabViewRect;
     tempRect.origin.y = 1000;
@@ -152,6 +409,11 @@ extern int vPerformLayoutCompat;
     [self.view addSubview:tabButtonBackground positioned:NSWindowAbove relativeTo:b];
     for (NSButton* tabButton in tabbuttons) {
         [self.view addSubview:tabButton positioned:NSWindowAbove relativeTo:nil];
+    }
+    if (tabSegment) {
+        tabSegment.selectedSegment = index;
+        [self.view addSubview:tabSegment positioned:NSWindowAbove relativeTo:nil];
+        [self syncSettingsSwitches];
     }
 }
 
@@ -486,6 +748,7 @@ extern int vPerformLayoutCompat;
     CustomBeepSound.state = (vSwitchKeyStatus & 0x8000) ? NSControlStateValueOn : NSControlStateValueOff;
     [CustomSwitchKey setTextByChar:((vSwitchKeyStatus>>24) & 0xFF)];
     
+    [self syncSettingsSwitches];
 }
 
 - (IBAction)onOK:(id)sender {
